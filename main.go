@@ -1,17 +1,24 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"goHttpServers/internal/database"
 	"log"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
 	"sync/atomic"
+
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	dbQueries      *database.Queries
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -52,8 +59,17 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 }
 
 func main() {
-
-	apiCfg := &apiConfig{}
+	godotenv.Load()
+	dbURL := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("Error al abrir la base de datos: %s", err)
+	}
+	defer db.Close()
+	dbQueries := database.New(db)
+	apiCfg := &apiConfig{
+		dbQueries: dbQueries,
+	}
 
 	mux := http.NewServeMux()
 
@@ -132,7 +148,7 @@ func main() {
 
 	fmt.Println("Starting server on http://localhost:8080 ...")
 
-	err := server.ListenAndServe()
+	err = server.ListenAndServe()
 
 	if err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server failed to start: %v", err)
