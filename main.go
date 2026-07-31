@@ -28,10 +28,11 @@ type apiConfig struct {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID          uuid.UUID `json:"id"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Email       string    `json:"email"`
+	IsChirpyRed bool      `json:"is_chirpy_red"`
 }
 
 type DatosRecibidos struct {
@@ -59,6 +60,7 @@ type loginResponse struct {
 	Email        string    `json:"email"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -218,6 +220,7 @@ func main() {
 			UpdatedAt:    user.UpdatedAt,
 			Token:        tokenString,
 			RefreshToken: refreshToken,
+			IsChirpyRed:  user.IsChirpyRed,
 		}
 
 		respondWithJSON(w, 200, usuarioLogueado)
@@ -316,10 +319,11 @@ func main() {
 
 		// 6. Devolver el usuario actualizado (usamos el struct User normal que no expone la password)
 		respondWithJSON(w, 200, User{
-			ID:        updatedUser.ID,
-			Email:     updatedUser.Email,
-			CreatedAt: updatedUser.CreatedAt,
-			UpdatedAt: updatedUser.UpdatedAt,
+			ID:          updatedUser.ID,
+			Email:       updatedUser.Email,
+			CreatedAt:   updatedUser.CreatedAt,
+			UpdatedAt:   updatedUser.UpdatedAt,
+			IsChirpyRed: updatedUser.IsChirpyRed,
 		})
 	})
 
@@ -462,6 +466,47 @@ func main() {
 		}
 		respondWithJSON(w, 200, chirpList)
 
+	})
+
+	mux.HandleFunc("POST /api/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		// 1. Estructura para leer el JSON que nos envía Polka
+		type polkaWebhook struct {
+			Event string `json:"event"`
+			Data  struct {
+				UserID uuid.UUID `json:"user_id"`
+			} `json:"data"`
+		}
+
+		var req polkaWebhook
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil {
+			respondWithError(w, 400, "Invalid JSON")
+			return
+		}
+
+		// 2. Si el evento NO es "user.upgraded", ignoramos y devolvemos 204
+		if req.Event != "user.upgraded" {
+			w.WriteHeader(http.StatusNoContent) // Status 204
+			return
+		}
+
+		// 3. Si ES "user.upgraded", actualizamos al usuario en la DB
+		_, err = dbQueries.UpgradeUserToRed(r.Context(), req.Data.UserID)
+		if err != nil {
+			// Si el error es que no encontró ninguna fila, es un 404
+			if errors.Is(err, sql.ErrNoRows) {
+				respondWithError(w, 404, "User not found")
+				return
+			}
+			// Si es otro error de base de datos, es un 500
+			respondWithError(w, 500, "Could not upgrade user")
+			return
+		}
+
+		// 4. Éxito: devolvemos 204 sin cuerpo
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("GET /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
