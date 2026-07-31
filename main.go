@@ -25,6 +25,7 @@ type apiConfig struct {
 	dbQueries      *database.Queries
 	platform       string
 	jwtSecret      string
+	polkaKey       string
 }
 
 type User struct {
@@ -102,16 +103,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error al abrir la base de datos: %s", err)
 	}
+	defer db.Close()
+	dbQueries := database.New(db)
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		log.Fatal("JWT_SECRET environment variable is not set")
 	}
-	defer db.Close()
-	dbQueries := database.New(db)
+	polkaKey := os.Getenv("POLKA_KEY")
+	if polkaKey == "" {
+		log.Fatal("POLKA_KEY environment variable is not set")
+	}
+
 	apiCfg := &apiConfig{
 		dbQueries: dbQueries,
 		platform:  platform,
 		jwtSecret: jwtSecret,
+		polkaKey:  polkaKey,
 	}
 
 	mux := http.NewServeMux()
@@ -471,7 +478,14 @@ func main() {
 	mux.HandleFunc("POST /api/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 
-		// 1. Estructura para leer el JSON que nos envía Polka
+		// 1. Extraer y validar el API Key
+		apiKey, err := auth.GetAPIKey(r.Header)
+		if err != nil || apiKey != apiCfg.polkaKey {
+			// Si no hay clave, está mal formada, o no coincide con la nuestra -> 401
+			respondWithError(w, 401, "Unauthorized")
+			return
+		}
+
 		type polkaWebhook struct {
 			Event string `json:"event"`
 			Data  struct {
@@ -480,7 +494,7 @@ func main() {
 		}
 
 		var req polkaWebhook
-		err := json.NewDecoder(r.Body).Decode(&req)
+		err = json.NewDecoder(r.Body).Decode(&req)
 		if err != nil {
 			respondWithError(w, 400, "Invalid JSON")
 			return

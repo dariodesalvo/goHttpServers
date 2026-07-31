@@ -103,3 +103,17 @@ func MakeRefreshToken() (string, error) {
 	}
 	return hex.EncodeToString(b), nil
 }
+
+func GetAPIKey(headers http.Header) (string, error) {
+	authHeader := headers.Get("Authorization")
+	if authHeader == "" {
+		return "", errors.New("no authorization header included")
+	}
+
+	if !strings.HasPrefix(authHeader, "ApiKey ") {
+		return "", errors.New("malformed authorization header")
+	}
+
+	// Quitamos el prefijo y los espacios para devolver solo la clave
+	return strings.TrimSpace(strings.TrimPrefix(authHeader, "ApiKey ")), nil
+}
