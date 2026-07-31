@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -452,17 +453,33 @@ func main() {
 
 	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
 
-		allChirp, err := dbQueries.GetChirps(r.Context())
+		// 1. Obtener parámetros de la URL
+		authorIDString := r.URL.Query().Get("author_id")
+		sortDirection := r.URL.Query().Get("sort") //
+
+		var allChirp []database.Chirp
+		var err error
+
+		// 2. Filtrar por autor si es necesario
+		if authorIDString != "" {
+			authorID, parseErr := uuid.Parse(authorIDString)
+			if parseErr != nil {
+				respondWithError(w, 400, "Invalid author ID")
+				return
+			}
+			allChirp, err = dbQueries.GetChirpsByAuthor(r.Context(), authorID)
+		} else {
+			allChirp, err = dbQueries.GetChirps(r.Context())
+		}
 
 		if err != nil {
-			respondWithError(w, 400, "Something went wrong")
+			respondWithError(w, 500, "Something went wrong fetching chirps")
 			return
 		}
 
+		// 3. Mapear a la estructura de respuesta
 		chirpList := []chirpResponse{}
-
 		for _, chori := range allChirp {
-			// 4. Copiamos los datos al formato de respuesta JSON
 			chirpList = append(chirpList, chirpResponse{
 				ID:        chori.ID,
 				CreatedAt: chori.CreatedAt,
@@ -471,8 +488,19 @@ func main() {
 				UserID:    chori.UserID,
 			})
 		}
-		respondWithJSON(w, 200, chirpList)
 
+		// 4. Ordenar en memoria con sort.Slice
+		sort.Slice(chirpList, func(i, j int) bool {
+			if sortDirection == "desc" {
+				// Si es desc, queremos que los más recientes (After) vayan primero
+				return chirpList[i].CreatedAt.After(chirpList[j].CreatedAt)
+			}
+			// Si es asc (o cualquier otro valor vacío), queremos que los más antiguos (Before) vayan primero
+			return chirpList[i].CreatedAt.Before(chirpList[j].CreatedAt)
+		})
+
+		// 5. Responder
+		respondWithJSON(w, 200, chirpList)
 	})
 
 	mux.HandleFunc("POST /api/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {

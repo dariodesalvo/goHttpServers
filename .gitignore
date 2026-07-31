@@ -1,1 +1,6 @@
 .env
+
+# binarios compilados
+/goHttpServers
+/out
+*.exe
