@@ -267,6 +267,62 @@ func main() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
+	mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		// 1. Extraer el token de los headers (Authentication)
+		tokenString, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			respondWithError(w, 401, "Missing token")
+			return
+		}
+
+		// 2. Validar el token y obtener el userID (Authorization)
+		userID, err := auth.ValidateJWT(tokenString, apiCfg.jwtSecret)
+		if err != nil {
+			respondWithError(w, 401, "Invalid or expired token")
+			return
+		}
+
+		// 3. Decodificar el body con los nuevos datos
+		var params struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+		err = json.NewDecoder(r.Body).Decode(&params)
+		if err != nil {
+			respondWithError(w, 400, "Invalid JSON")
+			return
+		}
+
+		// 4. Hashear la nueva contraseña
+		hashedPassword, err := auth.HashPassword(params.Password)
+		if err != nil {
+			respondWithError(w, 500, "Error hashing password")
+			return
+		}
+
+		// 5. Actualizar el usuario en la base de datos
+		// Usamos el userID extraído del token, ¡así es imposible que actualicen a otra persona!
+		updatedUser, err := dbQueries.UpdateUser(r.Context(), database.UpdateUserParams{
+			Email:          params.Email,
+			HashedPassword: hashedPassword,
+			ID:             userID,
+		})
+		if err != nil {
+			respondWithError(w, 500, "Error updating user")
+			return
+		}
+
+		// 6. Devolver el usuario actualizado (usamos el struct User normal que no expone la password)
+		respondWithJSON(w, 200, User{
+			ID:        updatedUser.ID,
+			Email:     updatedUser.Email,
+			CreatedAt: updatedUser.CreatedAt,
+			UpdatedAt: updatedUser.UpdatedAt,
+		})
+	})
+
 	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
 
 		// 1. Obtener el token del header Authorization
@@ -331,6 +387,56 @@ func main() {
 		}
 
 		respondWithJSON(w, 201, response)
+	})
+
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
+		// 1. Obtener y parsear el ID de la URL
+		chirpIDString := r.PathValue("chirpID")
+		chirpID, err := uuid.Parse(chirpIDString)
+		if err != nil {
+			respondWithError(w, 400, "Invalid chirp ID")
+			return
+		}
+
+		// 2. Extraer y validar el token (Autenticación)
+		tokenString, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			respondWithError(w, 401, "Missing token")
+			return
+		}
+
+		userID, err := auth.ValidateJWT(tokenString, apiCfg.jwtSecret)
+		if err != nil {
+			respondWithError(w, 401, "Invalid token")
+			return
+		}
+
+		// 3. Buscar el chirp en la DB para ver si existe y quién es el dueño
+		chirp, err := dbQueries.GetChirp(r.Context(), chirpID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				respondWithError(w, 404, "Chirp not found")
+				return
+			}
+			respondWithError(w, 500, "Error finding chirp")
+			return
+		}
+
+		// 4. Verificar permisos (Autorización: ¿El usuario es el dueño?)
+		if chirp.UserID != userID {
+			respondWithError(w, 403, "You can only delete your own chirps")
+			return
+		}
+
+		// 5. Eliminar el chirp
+		err = dbQueries.DeleteChirp(r.Context(), chirpID)
+		if err != nil {
+			respondWithError(w, 500, "Could not delete chirp")
+			return
+		}
+
+		// 6. Éxito: Enviar status 204 (No Content) sin body
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
