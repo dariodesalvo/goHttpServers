@@ -3,7 +3,9 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"goHttpServers/internal/auth"
 	"goHttpServers/internal/database"
 	"log"
 	"net/http"
@@ -11,7 +13,9 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
@@ -19,6 +23,42 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
+	platform       string
+	jwtSecret      string
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
+
+type DatosRecibidos struct {
+	Email            string `json:"email"`
+	Password         string `json:"password"`
+	ExpiresInSeconds int    `json:"expires_in_seconds"`
+}
+
+type newChirpy struct {
+	Body string `json:"body"`
+}
+
+type chirpResponse struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
+type loginResponse struct {
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -27,12 +67,6 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 		cfg.fileserverHits.Add(1)
 		next.ServeHTTP(w, r)
 	})
-}
-
-func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
-	cfg.fileserverHits.Store(0)
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
 }
 
 func respondWithError(w http.ResponseWriter, code int, msg string) {
@@ -61,14 +95,21 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
+	platform := os.Getenv("PLATFORM")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatalf("Error al abrir la base de datos: %s", err)
+	}
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		log.Fatal("JWT_SECRET environment variable is not set")
 	}
 	defer db.Close()
 	dbQueries := database.New(db)
 	apiCfg := &apiConfig{
 		dbQueries: dbQueries,
+		platform:  platform,
+		jwtSecret: jwtSecret,
 	}
 
 	mux := http.NewServeMux()
@@ -81,7 +122,7 @@ func main() {
 
 	mux.Handle("/app/", metricsHandler)
 
-	mux.HandleFunc("GET  /api/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		mensaje := "OK"
@@ -89,45 +130,271 @@ func main() {
 		w.Write(datosEnBytes)
 	})
 
-	mux.HandleFunc("POST  /api/validate_chirp", func(w http.ResponseWriter, r *http.Request) {
-
-		bad_words := []string{"kerfuffle", "sharbert", "fornax"}
-
-		type returnVals struct {
-			Cleaned_body string `json:"cleaned_body"`
-		}
-
-		type parameters struct {
-			Body string `json:"body"`
-		}
-
-		decoder := json.NewDecoder(r.Body)
-		params := parameters{}
-		err := decoder.Decode(&params)
+	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		// recibe el json email
+		var datos DatosRecibidos
+		err := json.NewDecoder(r.Body).Decode(&datos)
 		if err != nil {
-			log.Printf("Error decoding parameters: %s", err)
-			w.WriteHeader(500)
+			http.Error(w, "JSON inválido", http.StatusBadRequest)
 			return
 		}
 
-		if len(params.Body) > 140 {
-			respondWithError(w, 400, "Something went wrong")
-		} else {
-			words := strings.Split(params.Body, " ")
-			respuestas := []string{}
-			for _, word := range words {
-				if slices.Contains(bad_words, strings.ToLower(word)) {
-					word = "****"
-				}
-				respuestas = append(respuestas, word)
+		datos.Password, err = auth.HashPassword(datos.Password)
+		if err != nil {
+			http.Error(w, "Problemas codificando password", http.StatusBadRequest)
+			return
+		}
+
+		user, err := dbQueries.CreateUser(r.Context(), database.CreateUserParams{
+			Email:          datos.Email,
+			HashedPassword: datos.Password,
+		})
+		if err != nil {
+			respondWithError(w, 404, "Something went wrong")
+			return
+		}
+		nuevoUsuario := User{ID: user.ID, Email: user.Email, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt}
+		respondWithJSON(w, 201, nuevoUsuario)
+		//devuelve el json user
+	})
+
+	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		var datos DatosRecibidos
+		err := json.NewDecoder(r.Body).Decode(&datos)
+		if err != nil {
+			respondWithError(w, 400, "JSON inválido")
+			return
+		}
+
+		user, err := dbQueries.GetUserByEmail(r.Context(), datos.Email)
+		if err != nil {
+			respondWithError(w, 401, "Incorrect email or password")
+			return
+		}
+
+		match, err := auth.CheckPasswordHash(datos.Password, user.HashedPassword)
+		if err != nil || !match {
+			respondWithError(w, 401, "Incorrect email or password")
+			return
+		}
+
+		expiresIn := time.Hour
+		if datos.ExpiresInSeconds > 0 {
+			requestedExpiration := time.Duration(datos.ExpiresInSeconds) * time.Second
+			if requestedExpiration < time.Hour {
+				expiresIn = requestedExpiration
 			}
-			resultado := strings.Join(respuestas, " ")
-			respBody := returnVals{
-				Cleaned_body: resultado,
+		}
+
+		tokenString, err := auth.MakeJWT(user.ID, apiCfg.jwtSecret, expiresIn)
+		if err != nil {
+			respondWithError(w, 500, "Couldn't create JWT")
+			return
+		}
+
+		refreshToken, err := auth.MakeRefreshToken()
+		if err != nil {
+			respondWithError(w, 500, "Couldn't create refresh token")
+			return
+		}
+
+		_, err = dbQueries.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+			Token:     refreshToken,
+			UserID:    user.ID,
+			ExpiresAt: time.Now().UTC().Add(time.Hour * 24 * 60),
+		})
+		if err != nil {
+			respondWithError(w, 500, "Couldn't save refresh token")
+			return
+		}
+
+		usuarioLogueado := loginResponse{
+			ID:           user.ID,
+			Email:        user.Email,
+			CreatedAt:    user.CreatedAt,
+			UpdatedAt:    user.UpdatedAt,
+			Token:        tokenString,
+			RefreshToken: refreshToken,
+		}
+
+		respondWithJSON(w, 200, usuarioLogueado)
+	})
+
+	mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, r *http.Request) {
+		tokenString, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			respondWithError(w, 401, "Couldn't find refresh token")
+			return
+		}
+
+		// Buscamos el usuario asociado si el token es válido, no expiró y no fue revocado
+		user, err := dbQueries.GetUserFromRefreshToken(r.Context(), tokenString)
+		if err != nil {
+			respondWithError(w, 401, "Couldn't get user from refresh token")
+			return
+		}
+
+		// Generamos un nuevo Access Token de 1 hora
+		accessToken, err := auth.MakeJWT(user.ID, apiCfg.jwtSecret, time.Hour)
+		if err != nil {
+			respondWithError(w, 500, "Couldn't create JWT")
+			return
+		}
+
+		respondWithJSON(w, 200, struct {
+			Token string `json:"token"`
+		}{
+			Token: accessToken,
+		})
+	})
+
+	mux.HandleFunc("POST /api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		tokenString, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			respondWithError(w, 401, "Couldn't find refresh token")
+			return
+		}
+
+		err = dbQueries.RevokeRefreshToken(r.Context(), tokenString)
+		if err != nil {
+			respondWithError(w, 500, "Couldn't revoke refresh token")
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
+
+		// 1. Obtener el token del header Authorization
+		tokenString, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			// Si no hay token, devolvemos 401 Unauthorized
+			respondWithError(w, 401, "Couldn't find JWT")
+			return
+		}
+
+		// 2. Validar el token y obtener el ID real del usuario
+		userID, err := auth.ValidateJWT(tokenString, apiCfg.jwtSecret)
+		if err != nil {
+			// Si el token expiró o es falso, devolvemos 401
+			respondWithError(w, 401, "Couldn't validate JWT")
+			return
+		}
+
+		bad_words := []string{"kerfuffle", "sharbert", "fornax"}
+
+		var newchirpy newChirpy
+		err = json.NewDecoder(r.Body).Decode(&newchirpy)
+
+		if err != nil {
+			respondWithError(w, 500, "Error decoding chirpy")
+			return
+		}
+
+		if len(newchirpy.Body) > 140 {
+			respondWithError(w, 400, "Chirp is too long")
+			return
+		}
+
+		// Limpieza de palabras
+		words := strings.Split(newchirpy.Body, " ")
+		respuestas := []string{}
+		for _, word := range words {
+			if slices.Contains(bad_words, strings.ToLower(word)) {
+				word = "****"
+			}
+			respuestas = append(respuestas, word)
+		}
+		resultado := strings.Join(respuestas, " ")
+
+		// 3. Crear el chirp usando el userID SEGURO que sacamos del JWT
+		i, err := dbQueries.CreateChirp(r.Context(), database.CreateChirpParams{
+			Body:   resultado,
+			UserID: userID, // <-- ¡MAGIA AQUÍ! Ya no usamos newchirpy.User_id
+		})
+
+		if err != nil {
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		response := chirpResponse{
+			ID:        i.ID,
+			CreatedAt: i.CreatedAt,
+			UpdatedAt: i.UpdatedAt,
+			Body:      i.Body,
+			UserID:    i.UserID,
+		}
+
+		respondWithJSON(w, 201, response)
+	})
+
+	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
+
+		allChirp, err := dbQueries.GetChirps(r.Context())
+
+		if err != nil {
+			respondWithError(w, 400, "Something went wrong")
+			return
+		}
+
+		chirpList := []chirpResponse{}
+
+		for _, chori := range allChirp {
+			// 4. Copiamos los datos al formato de respuesta JSON
+			chirpList = append(chirpList, chirpResponse{
+				ID:        chori.ID,
+				CreatedAt: chori.CreatedAt,
+				UpdatedAt: chori.UpdatedAt,
+				Body:      chori.Body,
+				UserID:    chori.UserID,
+			})
+		}
+		respondWithJSON(w, 200, chirpList)
+
+	})
+
+	mux.HandleFunc("GET /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
+
+		chirpIDString := r.PathValue("chirpID")
+
+		chirpIDUUID, err := uuid.Parse(chirpIDString)
+
+		if err != nil {
+			respondWithError(w, 404, "Chirp not found")
+			return
+		}
+
+		oneChirp, err := dbQueries.GetChirp(r.Context(), chirpIDUUID)
+
+		if err != nil {
+
+			if errors.Is(err, sql.ErrNoRows) {
+				respondWithError(w, 404, "Chirp not found")
+				return
 			}
 
-			respondWithJSON(w, 200, respBody)
+			log.Printf("Error crítico en GetChirp: %v\n", err)
+
+			// Los errores desconocidos de DB deberían ser 500 (Internal Server Error)
+			respondWithError(w, 500, "Something went wrong")
+			return
 		}
+
+		chirpResponse := chirpResponse{
+			ID:        oneChirp.ID,
+			CreatedAt: oneChirp.CreatedAt,
+			UpdatedAt: oneChirp.UpdatedAt,
+			Body:      oneChirp.Body,
+			UserID:    oneChirp.UserID,
+		}
+
+		respondWithJSON(w, 200, chirpResponse)
+
 	})
 
 	mux.HandleFunc("GET /admin/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -139,7 +406,20 @@ func main() {
 		w.Write(datosEnBytes)
 	})
 
-	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
+	mux.HandleFunc("POST /admin/reset", func(w http.ResponseWriter, r *http.Request) {
+		if apiCfg.platform != platform {
+			respondWithError(w, http.StatusForbidden, "Forbidden")
+			return
+		}
+		apiCfg.fileserverHits.Store(0)
+		err := dbQueries.DeleteAllUsers(r.Context())
+		if err != nil {
+			respondWithError(w, 403, "Something went wrong")
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+	})
 
 	server := &http.Server{
 		Addr:    ":8080",
